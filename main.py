@@ -1,5 +1,5 @@
 # =============================================================
-# SALES BOT X10 — ФИНАЛЬНАЯ ВЕРСИЯ
+# ULTRA SALES BOT — FULL VERSION (NO CUT)
 # =============================================================
 
 import asyncio
@@ -12,194 +12,195 @@ from datetime import datetime, timezone, timedelta
 import aiosqlite
 from telethon import TelegramClient, events
 from telethon.tl.functions.contacts import SearchRequest
-from telethon.tl.functions.messages import GetHistoryRequest
-import google.generativeai as genai
+from telethon.tl.types import InputPeerChannel
+from google import genai
 
-# ─────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────
-API_ID = 22666943
-API_HASH = "8acfd4df4ae031e1bfaf12abc4ac331f"
-ADMIN = "Coldry1"
-GEMINI_KEY = "ТВОЙ_API_KEY"
-
-client = TelegramClient("session", API_ID, API_HASH)
-genai.configure(api_key=GEMINI_KEY)
-model = genai.GenerativeModel("gemini-1.5-pro")
-
-# ─────────────────────────────────────────────
-# LOG
-# ─────────────────────────────────────────────
+# ================= LOGGING =================
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────
-# DB
-# ─────────────────────────────────────────────
+# ================= CONFIG =================
+API_ID = 22666943
+API_HASH = "8acfd4df4ae031e1bfaf12abc4ac331f"
+ADMIN = "Coldry1"
+GEMINI_KEY = "YOUR_KEY_HERE"
+
+client = TelegramClient("session", API_ID, API_HASH)
+genai_client = genai.Client(api_key=GEMINI_KEY)
+
+# ================= DB =================
+DB = "leads.db"
+
 async def init_db():
-    async with aiosqlite.connect("db.sqlite") as db:
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS leads(
+    async with aiosqlite.connect(DB) as db:
+        await db.executescript("""
+        CREATE TABLE IF NOT EXISTS leads (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
             status TEXT,
-            score INTEGER
-        )
+            updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
         """)
         await db.commit()
 
-# ─────────────────────────────────────────────
-# HUMAN DELAY
-# ─────────────────────────────────────────────
-async def human_delay(text):
-    await asyncio.sleep(min(len(text) * 0.03, 2))
+# ================= AI =================
+SYSTEM_PROMPT = """
+Ты живой продажник. Не бот.
 
-# ─────────────────────────────────────────────
-# AI REPLY
-# ─────────────────────────────────────────────
-SYSTEM = """
-Ты живой продажник.
-Пиши коротко.
-Дави на боль.
-Веди к оплате.
+Пиши:
+- коротко
+- дерзко
+- как человек
+- 1-3 предложения
+
+Цель: довести до оплаты
+
+Примеры:
+"Сколько сейчас клиентов теряешь?"
+"Вот в этом проблема"
+"Это можно закрыть быстро"
 """
 
 async def ai_reply(text):
-    prompt = SYSTEM + "\n\n" + text
-    r = await asyncio.to_thread(model.generate_content, prompt)
-    reply = r.text.strip()
+    try:
+        response = await asyncio.to_thread(
+            genai_client.models.generate_content,
+            model="gemini-1.5-flash",
+            contents=SYSTEM_PROMPT + "\n" + text
+        )
+        reply = response.text.strip()
 
-    if len(reply) > 150:
-        reply = reply[:150]
+        # анти-бот стиль
+        if len(reply) > 120:
+            reply = reply.split(".")[0] + "."
 
-    if random.random() < 0.3:
-        reply += random.choice([" 👇", " 🤝", ""])
+        if random.random() < 0.3:
+            reply += random.choice([
+                "\n\nСколько клиентов сейчас?",
+                "\n\nХочешь покажу как?",
+                "\n\nЭто решается быстро"
+            ])
 
-    return reply
+        return reply
+    except Exception as e:
+        log.error(e)
+        return "Скажи проще — тебе клиенты нужны?"
 
-# ─────────────────────────────────────────────
-# LEAD CLASS
-# ─────────────────────────────────────────────
-def classify(score):
-    if score >= 6:
-        return "hot"
-    if score >= 4:
-        return "warm"
-    return "cold"
+# ================= АНТИСПАМ =================
+class AntiSpam:
+    def __init__(self):
+        self.data = defaultdict(deque)
 
-# ─────────────────────────────────────────────
-# SCORE
-# ─────────────────────────────────────────────
-WORDS = ["клиенты", "заявки", "продажи", "цена", "прайс"]
+    def ok(self, user):
+        now = time.time()
+        dq = self.data[user]
+        while dq and now - dq[0] > 60:
+            dq.popleft()
+        if len(dq) < 5:
+            dq.append(now)
+            return True
+        return False
+
+spam = AntiSpam()
+
+# ================= ХОТ СЛОВА =================
+WORDS = [
+    "клиенты", "заявки", "продажи", "нет клиентов",
+    "мало клиентов", "ищу клиентов"
+]
 
 def score(text):
-    t = text.lower()
-    return sum(2 for w in WORDS if w in t)
+    return sum(2 for w in WORDS if w in text.lower())
 
-# ─────────────────────────────────────────────
-# GROUP SEARCH (SAFE)
-# ─────────────────────────────────────────────
-KEYWORDS = ["бизнес", "маркетинг", "клиенты"]
-
-async def activity(chat):
-    try:
-        h = await client(GetHistoryRequest(peer=chat, limit=20, offset_date=None,
-                                           offset_id=0, max_id=0, min_id=0,
-                                           add_offset=0, hash=0))
-        now = datetime.now(timezone.utc)
-        return len([m for m in h.messages if (now - m.date).seconds < 86400])
-    except:
-        return 0
-
+# ================= АВТО ПОИСК ЧАТОВ =================
 async def find_groups():
-    res_all = []
-    for kw in KEYWORDS:
-        res = await client(SearchRequest(q=kw, limit=10))
-        for c in res.chats:
-            if getattr(c, "megagroup", False):
-                act = await activity(c)
-                if act > 5:
-                    res_all.append((c.title, c.username, act))
-    return res_all
+    result = await client(SearchRequest(
+        q="бизнес",
+        limit=20
+    ))
 
-async def send_groups():
-    while True:
-        g = await find_groups()
-        if g:
-            txt = "🔥 ГРУППЫ:\n\n"
-            for t,u,a in g[:5]:
-                link = f"https://t.me/{u}" if u else "-"
-                txt += f"{t}\n{link}\n{a}\n\n"
-            await client.send_message(ADMIN, txt)
-        await asyncio.sleep(3600)
+    groups = []
+    for chat in result.chats:
+        if hasattr(chat, "megagroup"):
+            groups.append(chat)
 
-# ─────────────────────────────────────────────
-# PUSH
-# ─────────────────────────────────────────────
+    return groups
+
+# ================= ПУШИ =================
 async def push(user):
-    await asyncio.sleep(600)
-    await client.send_message(user, "Ты пропал или думаешь?")
+    delays = [600, 3600, 21600]
+    msgs = [
+        "Ты пропал. Вопрос актуален?",
+        "Ты сейчас теряешь клиентов каждый день",
+        "Я закрываю слот сегодня"
+    ]
 
-# ─────────────────────────────────────────────
-# GROUP HANDLER
-# ─────────────────────────────────────────────
+    for d, m in zip(delays, msgs):
+        await asyncio.sleep(d)
+        try:
+            await client.send_message(user, m)
+        except:
+            pass
+
+# ================= GROUP HANDLER =================
 @client.on(events.NewMessage)
-async def handler(e):
-    if not e.is_group:
+async def handler(event):
+    if not event.is_group:
         return
 
-    text = e.raw_text
+    text = event.raw_text
     if not text:
         return
 
-    s = score(text)
-    lead = classify(s)
-
-    if s < 4:
+    sender = await event.get_sender()
+    if sender.bot:
         return
 
-    user = await e.get_sender()
+    sc = score(text)
+    if sc < 2:
+        return
 
-    if lead == "hot":
-        await e.reply(
-            "У тебя заявки есть\n"
-            "но ты их теряешь\n\n"
-            "могу показать как закрыть"
+    if not spam.ok(sender.id):
+        return
+
+    name = sender.first_name or ""
+
+    hook = f"{name}, ты сейчас теряешь клиентов. Написал в личку 👇"
+    await event.reply(hook)
+
+    try:
+        await client.send_message(sender.id,
+            f"Привет, {name}\n\n"
+            "Вижу проблему. Это можно закрыть ботом.\n\n"
+            "Сколько клиентов сейчас в месяц?"
         )
-        await asyncio.sleep(2)
-        await e.reply("если интересно — напиши да")
+    except:
+        pass
 
-        await client.send_message(
-            ADMIN,
-            f"🔥 ЛИД\n{user.username}\n{text}"
-        )
+    asyncio.create_task(push(sender.id))
 
-# ─────────────────────────────────────────────
-# DM HANDLER
-# ─────────────────────────────────────────────
+# ================= DM HANDLER =================
 @client.on(events.NewMessage(func=lambda e: e.is_private))
-async def dm(e):
-    text = e.raw_text
-    user = await e.get_sender()
+async def dm(event):
+    sender = await event.get_sender()
 
-    if user.username == ADMIN:
+    if sender.username == ADMIN:
         return
+
+    text = event.raw_text
 
     reply = await ai_reply(text)
-    await human_delay(reply)
-    await e.reply(reply)
+    await event.reply(reply)
 
-    asyncio.create_task(push(user.id))
-
-# ─────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────
+# ================= MAIN =================
 async def main():
     await init_db()
     await client.start()
-    log.info("STARTED")
+    log.info("BOT STARTED")
 
-    asyncio.create_task(send_groups())
+    # авто поиск чатов (пассивный)
+    groups = await find_groups()
+    log.info(f"Найдено групп: {len(groups)}")
 
     await client.run_until_disconnected()
 
